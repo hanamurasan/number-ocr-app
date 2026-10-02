@@ -120,7 +120,7 @@ def longest_active_span(profile, threshold, max_gap=4):
 def align_number(gray):
     """
     輪郭を使わず、縦横のエッジ投影から数字列全体を探す。
-    数字列を標準キャンバス126×72へ配置し、固定3スロットを安定させる。
+    小数点を含む数字列全体を標準キャンバス126×72へ配置する。3つの数字枠は等分せず、小数点の幅を空ける。
     """
     gray = cv2.resize(gray, (252, 144), interpolation=cv2.INTER_CUBIC)
     corrected, angle = deskew(gray)
@@ -184,8 +184,9 @@ def align_number(gray):
     return canvas, corrected, (x1, y1, x2, y2), angle
 
 
-# 自動整列後の固定3スロット。小数点は読み取らず、最後に規則で挿入する。
-SLOTS = [(2, 43), (42, 83), (83, 124)]
+# 小数点の場所を空けた固定3スロット。小数点は読み取らず、最後に規則で挿入する。
+SLOTS = [(0, 39), (35, 74), (82, 124)]
+DECIMAL_GAP = (74, 82)
 
 
 def charfeat(aligned, position):
@@ -305,7 +306,8 @@ for i, file in enumerate(files):
         preview = cv2.cvtColor(aligned, cv2.COLOR_GRAY2RGB)
         for x1, x2 in SLOTS:
             cv2.rectangle(preview, (x1, 3), (x2, 69), (255, 0, 0), 1)
-        right.image(preview, caption="自動整列後の画像（赤枠が3桁に合っているか確認）", width="stretch")
+        cv2.rectangle(preview, (DECIMAL_GAP[0], 48), (DECIMAL_GAP[1], 69), (0, 255, 255), 1)
+        right.image(preview, caption="赤枠＝数字3桁、黄色枠＝無視する小数点部分", width="stretch")
 
     if confidence < 0.45:
         right.warning("信頼度が低いため確認してください。")
