@@ -88,22 +88,69 @@ def binary_image(gray):
 
 
 def raw_digit_boxes(bw):
+    """数字らしい輪郭だけを残す。ROIの枠・文字・十字の残りは除外する。"""
     h, w = bw.shape
-    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
+
+    # 現在のROIでは数字は中央付近に並ぶため、上下端と左右端を探索対象から外す
+    work = bw.copy()
+    work[:int(h * 0.12), :] = 0
+    work[int(h * 0.90):, :] = 0
+    work[:, :int(w * 0.03)] = 0
+    work[:, int(w * 0.97):] = 0
+
+    contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
     for contour in contours:
         x, y, cw, ch = cv2.boundingRect(contour)
         area = cv2.contourArea(contour)
-        # 小数点、十字の残り、微小ノイズを除外
-        if ch < h * 0.28 or ch > h * 0.98:
-            continue
-        if cw < w * 0.018 or cw > w * 0.34:
-            continue
-        if area < h * w * 0.0012:
-            continue
-        boxes.append((x, y, cw, ch))
-    return sorted(boxes, key=lambda b: b[0])
+        box_area = max(cw * ch, 1)
+        fill = area / box_area
+        cy = y + ch / 2
 
+        # 小数点・細線・外枠・巨大な背景輪郭を除外
+        if not (h * 0.32 <= ch <= h * 0.82):
+            continue
+        if not (w * 0.025 <= cw <= w * 0.22):
+            continue
+        if not (h * 0.25 <= cy <= h * 0.78):
+            continue
+        if not (0.06 <= fill <= 0.80):
+            continue
+        if x <= 1 or y <= 1 or x + cw >= w - 1 or y + ch >= h - 1:
+            continue
+        candidates.append((x, y, cw, ch))
+
+    # 高さと縦位置が近い3個を、全組合せから選ぶ
+    if len(candidates) < 3:
+        return sorted(candidates, key=lambda b: b[0])
+
+    from itertools import combinations
+    best = None
+    best_score = -1e18
+    for group in combinations(candidates, 3):
+        group = sorted(group, key=lambda b: b[0])
+        heights = np.array([b[3] for b in group], dtype=float)
+        centers = np.array([b[1] + b[3] / 2 for b in group], dtype=float)
+        widths = np.array([b[2] for b in group], dtype=float)
+        left_gap = group[1][0] - (group[0][0] + group[0][2])
+        right_gap = group[2][0] - (group[1][0] + group[1][2])
+
+        # 左から順に離れていて、同じ行・同程度の高さの3個を優先
+        if left_gap < -w * 0.03 or right_gap < -w * 0.03:
+            continue
+        span = (group[2][0] + group[2][2]) - group[0][0]
+        score = (
+            3.0 * heights.mean()
+            - 4.0 * heights.std()
+            - 3.0 * centers.std()
+            - 0.8 * widths.std()
+            + 0.25 * span
+            - 0.25 * abs(left_gap - right_gap)
+        )
+        if score > best_score:
+            best_score = score
+            best = group
+    return best or []
 
 def rotate_gray(gray, angle):
     h, w = gray.shape
@@ -312,7 +359,7 @@ for i, file in enumerate(files):
         preview = cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
         for x, y, w, h in digit_boxes:
             cv2.rectangle(preview, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        right.image(preview, caption=f"検出した数字：{len(digit_boxes)}個", width="stretch")
+        right.image(preview, caption=f"赤枠が数字3文字を囲めているか確認：{len(digit_boxes)}個", width="stretch")
 
     if len(digit_boxes) != 3:
         right.error("数字を3個検出できませんでした。認識結果を手入力してください。")
