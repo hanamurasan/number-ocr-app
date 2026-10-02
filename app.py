@@ -15,9 +15,9 @@ from openpyxl.utils.cell import (
 )
 
 B = Path(__file__).parent
-st.set_page_config(page_title="輪郭検出で一桁ずつ認識→Excel", page_icon="🔢", layout="wide")
-st.title("🔢 角度補正＋輪郭検出で数字を一桁ずつ認識")
-st.caption("数字3文字を輪郭から検出し、最後の数字の前に小数点を自動挿入します。")
+st.set_page_config(page_title="位置補正版・一桁ずつ認識→Excel", page_icon="🔢", layout="wide")
+st.title("🔢 数字列の位置をそろえて一桁ずつ認識")
+st.caption("輪郭検出は使いません。十字を基準に切り出し、傾きと数字列の位置を補正してから固定3スロットで判定します。")
 
 L = pd.read_csv(B / "labels.csv", dtype=str)
 CT = [cv2.imread(str(p), 0) for p in (B / "cross_templates").glob("*.png")]
@@ -36,21 +36,19 @@ def cross(rgb):
     best = (-2.0, None, None)
 
     for template in CT:
-        template_edge = cv2.Canny(template, 45, 140)
+        z0 = cv2.Canny(template, 45, 140)
         for scale in np.linspace(0.45, 2.4, 32):
-            tw = max(10, int(template_edge.shape[1] * scale))
-            th = max(10, int(template_edge.shape[0] * scale))
+            tw = max(10, int(z0.shape[1] * scale))
+            th = max(10, int(z0.shape[0] * scale))
             if tw >= w or th >= h:
                 continue
-
-            resized = cv2.resize(template_edge, (tw, th))
-            result = cv2.matchTemplate(edge, resized, cv2.TM_CCOEFF_NORMED)
+            z = cv2.resize(z0, (tw, th))
+            result = cv2.matchTemplate(edge, z, cv2.TM_CCOEFF_NORMED)
             mask = np.full(result.shape, -2, np.float32)
             y1, y2 = int(result.shape[0] * 0.12), int(result.shape[0] * 0.90)
             x1, x2 = int(result.shape[1] * 0.10), int(result.shape[1] * 0.90)
             mask[y1:y2, x1:x2] = result[y1:y2, x1:x2]
             _, score, _, loc = cv2.minMaxLoc(mask)
-
             if score > best[0]:
                 best = (score, (loc[0] + tw // 2, loc[1] + th // 2), max(tw, th))
     return best
@@ -61,98 +59,15 @@ def roi(rgb, center, size):
     unit = size / 30.0
     h, w = rgb.shape[:2]
     box = (
-        max(0, int(cx - 45 * unit)),
-        max(0, int(cy - 30 * unit)),
-        min(w, int(cx - 3 * unit)),
-        min(h, int(cy - 6 * unit)),
+        max(0, int(cx - 48 * unit)),
+        max(0, int(cy - 33 * unit)),
+        min(w, int(cx - 1 * unit)),
+        min(h, int(cy - 3 * unit)),
     )
     return rgb[box[1]:box[3], box[0]:box[2]], box
 
 
-def normroi(x):
-    if x is None or x.size == 0:
-        return None
-    gray = cv2.cvtColor(x, cv2.COLOR_RGB2GRAY)
-    return cv2.resize(gray, (252, 144), interpolation=cv2.INTER_CUBIC)
-
-
-def binary_image(gray):
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    bw = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 31, 7
-    )
-    # 細い切れ目だけをつなぎ、隣の数字同士は結合しにくい縦長カーネル
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3))
-    return cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-
-def raw_digit_boxes(bw):
-    """数字らしい輪郭だけを残す。ROIの枠・文字・十字の残りは除外する。"""
-    h, w = bw.shape
-
-    # 現在のROIでは数字は中央付近に並ぶため、上下端と左右端を探索対象から外す
-    work = bw.copy()
-    work[:int(h * 0.12), :] = 0
-    work[int(h * 0.90):, :] = 0
-    work[:, :int(w * 0.03)] = 0
-    work[:, int(w * 0.97):] = 0
-
-    contours, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-    for contour in contours:
-        x, y, cw, ch = cv2.boundingRect(contour)
-        area = cv2.contourArea(contour)
-        box_area = max(cw * ch, 1)
-        fill = area / box_area
-        cy = y + ch / 2
-
-        # 小数点・細線・外枠・巨大な背景輪郭を除外
-        if not (h * 0.32 <= ch <= h * 0.82):
-            continue
-        if not (w * 0.025 <= cw <= w * 0.22):
-            continue
-        if not (h * 0.25 <= cy <= h * 0.78):
-            continue
-        if not (0.06 <= fill <= 0.80):
-            continue
-        if x <= 1 or y <= 1 or x + cw >= w - 1 or y + ch >= h - 1:
-            continue
-        candidates.append((x, y, cw, ch))
-
-    # 高さと縦位置が近い3個を、全組合せから選ぶ
-    if len(candidates) < 3:
-        return sorted(candidates, key=lambda b: b[0])
-
-    from itertools import combinations
-    best = None
-    best_score = -1e18
-    for group in combinations(candidates, 3):
-        group = sorted(group, key=lambda b: b[0])
-        heights = np.array([b[3] for b in group], dtype=float)
-        centers = np.array([b[1] + b[3] / 2 for b in group], dtype=float)
-        widths = np.array([b[2] for b in group], dtype=float)
-        left_gap = group[1][0] - (group[0][0] + group[0][2])
-        right_gap = group[2][0] - (group[1][0] + group[1][2])
-
-        # 左から順に離れていて、同じ行・同程度の高さの3個を優先
-        if left_gap < -w * 0.03 or right_gap < -w * 0.03:
-            continue
-        span = (group[2][0] + group[2][2]) - group[0][0]
-        score = (
-            3.0 * heights.mean()
-            - 4.0 * heights.std()
-            - 3.0 * centers.std()
-            - 0.8 * widths.std()
-            + 0.25 * span
-            - 0.25 * abs(left_gap - right_gap)
-        )
-        if score > best_score:
-            best_score = score
-            best = group
-    return best or []
-
-def rotate_gray(gray, angle):
+def rotate_keep(gray, angle):
     h, w = gray.shape
     matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
     return cv2.warpAffine(
@@ -161,91 +76,127 @@ def rotate_gray(gray, angle):
     )
 
 
+def angle_score(gray):
+    """数字の横線が同じ高さに集まるほど大きくなるスコア。輪郭は使わない。"""
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    edge = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+    edge = np.abs(edge)
+    h, w = edge.shape
+    middle = edge[int(h * 0.12):int(h * 0.90), int(w * 0.05):int(w * 0.95)]
+    projection = middle.sum(axis=1)
+    return float(np.var(projection))
+
+
 def deskew(gray):
-    """数字候補の中心を直線近似し、数字列が水平になるように回転する。"""
-    bw = binary_image(gray)
-    boxes = raw_digit_boxes(bw)
-    if len(boxes) < 2:
-        return gray, 0.0
-
-    # 大きい候補を最大5個に絞り、x順で傾きを求める
-    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[:5]
-    boxes = sorted(boxes, key=lambda b: b[0])
-    xs = np.array([x + w / 2 for x, y, w, h in boxes], dtype=np.float32)
-    ys = np.array([y + h / 2 for x, y, w, h in boxes], dtype=np.float32)
-    if float(xs.max() - xs.min()) < 10:
-        return gray, 0.0
-
-    slope = float(np.polyfit(xs, ys, 1)[0])
-    angle = float(np.degrees(np.arctan(slope)))
-    angle = float(np.clip(angle, -18.0, 18.0))
-    return rotate_gray(gray, angle), angle
-
-
-def choose_three_boxes(boxes):
-    """数字候補が多い場合、近い高さ・大きさで左から連続する3個を選ぶ。"""
-    if len(boxes) < 3:
-        return []
-    if len(boxes) == 3:
-        return boxes
-
-    best_score = -1e9
-    best = None
-    for i in range(len(boxes) - 2):
-        group = boxes[i:i + 3]
-        heights = np.array([b[3] for b in group], dtype=float)
-        centers_y = np.array([b[1] + b[3] / 2 for b in group], dtype=float)
-        gaps = np.array([
-            group[1][0] - (group[0][0] + group[0][2]),
-            group[2][0] - (group[1][0] + group[1][2]),
-        ], dtype=float)
-        score = (
-            heights.mean()
-            - 2.0 * heights.std()
-            - 1.5 * centers_y.std()
-            - 0.5 * abs(gaps[0] - gaps[1])
-        )
+    """-10～10度を試し、横方向の並びが最もそろう角度へ補正する。"""
+    small = cv2.resize(gray, (188, 120), interpolation=cv2.INTER_AREA)
+    best_angle = 0.0
+    best_score = angle_score(small)
+    for angle in np.arange(-10.0, 10.01, 1.0):
+        candidate = rotate_keep(small, angle)
+        score = angle_score(candidate)
         if score > best_score:
             best_score = score
-            best = group
-    return best or []
+            best_angle = float(angle)
+    return rotate_keep(gray, best_angle), best_angle
 
 
-def extract_digits(gray):
+def longest_active_span(profile, threshold, max_gap=4):
+    """投影値が高い範囲を、小さな切れ目を埋めながら一つの連続範囲にする。"""
+    active = profile > threshold
+    if not active.any():
+        return None
+
+    # 小数点や桁間で分断されないよう短い空白を埋める
+    active = active.astype(np.uint8)
+    kernel = np.ones(max_gap * 2 + 1, np.uint8)
+    closed = cv2.morphologyEx(active.reshape(1, -1), cv2.MORPH_CLOSE, kernel).ravel() > 0
+    indexes = np.where(closed)[0]
+    if len(indexes) == 0:
+        return None
+    return int(indexes[0]), int(indexes[-1] + 1)
+
+
+def align_number(gray):
+    """
+    輪郭を使わず、縦横のエッジ投影から数字列全体を探す。
+    数字列を標準キャンバス126×72へ配置し、固定3スロットを安定させる。
+    """
+    gray = cv2.resize(gray, (252, 144), interpolation=cv2.INTER_CUBIC)
     corrected, angle = deskew(gray)
-    bw = binary_image(corrected)
-    boxes = choose_three_boxes(raw_digit_boxes(bw))
-    digits = []
 
-    for x, y, w, h in boxes:
-        pad_x = max(2, int(w * 0.15))
-        pad_y = max(2, int(h * 0.08))
-        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
-        x2, y2 = min(bw.shape[1], x + w + pad_x), min(bw.shape[0], y + h + pad_y)
-        digits.append(bw[y1:y2, x1:x2])
-    return digits, boxes, corrected, bw, angle
+    blur = cv2.GaussianBlur(corrected, (3, 3), 0)
+    gx = np.abs(cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3))
+    gy = np.abs(cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3))
+    energy = gx + gy
+    h, w = energy.shape
+
+    # 十字や外枠が入りやすい端を無視して、数字列の縦位置を投影で探す
+    row_profile = energy[:, int(w * 0.05):int(w * 0.95)].mean(axis=1)
+    row_profile[:int(h * 0.08)] = 0
+    row_profile[int(h * 0.92):] = 0
+    row_threshold = max(float(np.percentile(row_profile, 62)), float(row_profile.mean() * 1.05))
+    row_span = longest_active_span(row_profile, row_threshold, max_gap=5)
+
+    if row_span is None:
+        y1, y2 = int(h * 0.15), int(h * 0.88)
+    else:
+        y1, y2 = row_span
+        pad = max(4, int((y2 - y1) * 0.18))
+        y1, y2 = max(0, y1 - pad), min(h, y2 + pad)
+
+    # 数字の高さとして不自然なら安全な中央範囲へ戻す
+    if y2 - y1 < h * 0.30 or y2 - y1 > h * 0.90:
+        y1, y2 = int(h * 0.15), int(h * 0.88)
+
+    col_profile = energy[y1:y2, :].mean(axis=0)
+    col_profile[:int(w * 0.03)] = 0
+    col_profile[int(w * 0.97):] = 0
+    col_threshold = max(float(np.percentile(col_profile, 58)), float(col_profile.mean()))
+    col_span = longest_active_span(col_profile, col_threshold, max_gap=8)
+
+    if col_span is None:
+        x1, x2 = int(w * 0.05), int(w * 0.95)
+    else:
+        x1, x2 = col_span
+        pad = max(6, int((x2 - x1) * 0.08))
+        x1, x2 = max(0, x1 - pad), min(w, x2 + pad)
+
+    # 3桁として幅が狭すぎる・広すぎる検出は採用しない
+    if x2 - x1 < w * 0.35 or x2 - x1 > w * 0.96:
+        x1, x2 = int(w * 0.05), int(w * 0.95)
+
+    crop = corrected[y1:y2, x1:x2]
+    if crop.size == 0:
+        crop = corrected
+        x1, y1, x2, y2 = 0, 0, w, h
+
+    # 縦横比を保持して標準キャンバスへ中央配置
+    target_w, target_h = 126, 72
+    ch, cw = crop.shape
+    scale = min((target_w - 4) / max(cw, 1), (target_h - 4) / max(ch, 1))
+    nw, nh = max(1, int(cw * scale)), max(1, int(ch * scale))
+    resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+    canvas = np.full((target_h, target_w), int(np.median(corrected)), np.uint8)
+    ox, oy = (target_w - nw) // 2, (target_h - nh) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = resized
+
+    return canvas, corrected, (x1, y1, x2, y2), angle
 
 
-def charfeat(binary_digit):
-    """輪郭で切り出した1文字を余白付き48×64へ正規化する。"""
-    if binary_digit is None or binary_digit.size == 0:
-        return None
-    ys, xs = np.where(binary_digit > 0)
-    if len(xs) == 0:
-        return None
-    crop = binary_digit[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
-    h, w = crop.shape
-    scale = min(38 / max(w, 1), 54 / max(h, 1))
-    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-    resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
-    canvas = np.zeros((64, 48), np.uint8)
-    x0, y0 = (48 - nw) // 2, (64 - nh) // 2
-    canvas[y0:y0 + nh, x0:x0 + nw] = resized
-    feat = cv2.GaussianBlur(canvas, (3, 3), 0).astype(np.float32) / 255.0
-    return (feat - feat.mean()) / (feat.std() + 1e-6)
+# 自動整列後の固定3スロット。小数点は読み取らず、最後に規則で挿入する。
+SLOTS = [(2, 43), (42, 83), (83, 124)]
 
 
-# 学習画像から各桁テンプレートを作成
+def charfeat(aligned, position):
+    x1, x2 = SLOTS[position]
+    part = aligned[3:69, x1:x2]
+    part = cv2.resize(part, (32, 48), interpolation=cv2.INTER_CUBIC)
+    feature = cv2.Laplacian(part, cv2.CV_32F)
+    return (feature - feature.mean()) / (feature.std() + 1e-6)
+
+
+# 学習画像にも新規画像にも同じ自動整列を適用する
 T = []
 training_failures = []
 for _, row in L.iterrows():
@@ -253,55 +204,50 @@ for _, row in L.iterrows():
     if not path.exists():
         training_failures.append(str(row.filename))
         continue
+
     rgb = np.array(Image.open(path).convert("RGB"))
     score, center, size = cross(rgb)
-    if not center:
-        training_failures.append(str(row.filename))
-        continue
-    region, _ = roi(rgb, center, size)
-    gray = normroi(region)
-    if gray is None:
-        training_failures.append(str(row.filename))
-        continue
-    digit_images, _, _, _, _ = extract_digits(gray)
     label_digits = re.sub(r"\D", "", str(row.value))
-    if len(digit_images) != 3 or len(label_digits) != 3:
+    if not center or len(label_digits) != 3:
         training_failures.append(str(row.filename))
         continue
-    for position, (digit, image) in enumerate(zip(label_digits, digit_images)):
-        feature = charfeat(image)
-        if feature is not None:
-            T.append((position, digit, feature))
+
+    region, _ = roi(rgb, center, size)
+    if region.size == 0:
+        training_failures.append(str(row.filename))
+        continue
+
+    gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+    aligned, _, _, _ = align_number(gray)
+    for position, digit in enumerate(label_digits):
+        T.append((position, digit, charfeat(aligned, position)))
 
 
 def recognize(rgb):
     score, center, size = cross(rgb)
     if not center:
-        return "", 0.0, None, None, [], None, [], 0.0
+        return "", 0.0, None, None, [], None, None, 0.0
 
     region, box = roi(rgb, center, size)
-    gray = normroi(region)
-    if gray is None:
-        return "", 0.0, box, center, [], None, [], 0.0
+    if region.size == 0:
+        return "", 0.0, box, center, [], None, None, 0.0
 
-    digit_images, digit_boxes, corrected, bw, angle = extract_digits(gray)
-    if len(digit_images) != 3:
-        return "", 0.0, box, center, [], bw, digit_boxes, angle
-
+    gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+    aligned, corrected, align_box, angle = align_number(gray)
     output = ""
     details = []
     scores = []
-    for position, digit_image in enumerate(digit_images):
-        query = charfeat(digit_image)
+
+    for position in range(3):
+        query = charfeat(aligned, position)
         candidates = [
             (float((query * template).mean()), digit)
-            for pos, digit, template in T
-            if pos == position and query is not None
+            for pos, digit, template in T if pos == position
         ]
         if not candidates:
-            return "", 0.0, box, center, details, bw, digit_boxes, angle
+            return "", 0.0, box, center, details, aligned, align_box, angle
 
-        # 同じ数字の複数テンプレートのうち最高値を代表値にする
+        # 同じ数字の登録画像が多くても不公平にならないよう、各数字の最高値だけを比較
         best_by_digit = {}
         for similarity, digit in candidates:
             best_by_digit[digit] = max(similarity, best_by_digit.get(digit, -1e9))
@@ -314,7 +260,7 @@ def recognize(rgb):
         details.append(ranking[:4])
 
     value = output[:-1] + "." + output[-1]
-    return value, float(np.mean(scores)), box, center, details, bw, digit_boxes, angle
+    return value, float(np.mean(scores)), box, center, details, aligned, align_box, angle
 
 
 def cellok(value):
@@ -342,7 +288,7 @@ if files:
 rows = []
 for i, file in enumerate(files):
     rgb = np.array(Image.open(file).convert("RGB"))
-    value, confidence, box, center, details, bw, digit_boxes, angle = recognize(rgb)
+    value, confidence, box, center, details, aligned, align_box, angle = recognize(rgb)
     marked = rgb.copy()
 
     if box:
@@ -355,15 +301,13 @@ for i, file in enumerate(files):
     value = right.text_input("認識結果", value, key=str(i) + file.name)
     right.write(f"角度補正：{angle:+.1f}°　3桁の平均類似度：{confidence:.2f}")
 
-    if bw is not None:
-        preview = cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
-        for x, y, w, h in digit_boxes:
-            cv2.rectangle(preview, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        right.image(preview, caption=f"赤枠が数字3文字を囲めているか確認：{len(digit_boxes)}個", width="stretch")
+    if aligned is not None:
+        preview = cv2.cvtColor(aligned, cv2.COLOR_GRAY2RGB)
+        for x1, x2 in SLOTS:
+            cv2.rectangle(preview, (x1, 3), (x2, 69), (255, 0, 0), 1)
+        right.image(preview, caption="自動整列後の画像（赤枠が3桁に合っているか確認）", width="stretch")
 
-    if len(digit_boxes) != 3:
-        right.error("数字を3個検出できませんでした。認識結果を手入力してください。")
-    elif confidence < 0.45:
+    if confidence < 0.45:
         right.warning("信頼度が低いため確認してください。")
 
     with right.expander("各桁の候補"):
@@ -378,7 +322,6 @@ for i, file in enumerate(files):
         "value": value,
         "confidence": round(confidence, 3),
         "angle": round(angle, 2),
-        "detected_digits": len(digit_boxes),
     })
 
 if rows:
@@ -392,18 +335,18 @@ if rows:
             letters, first_row = coordinate_from_string(start.upper())
             column = column_index_from_string(letters)
             worksheet = workbook[sheet_name]
-            invalid_values = []
+            invalid = []
 
             for offset, row in enumerate(rows):
                 try:
-                    numeric_value = float(row["value"])
-                    cell = worksheet.cell(first_row + offset, column, numeric_value)
+                    numeric = float(row["value"])
+                    cell = worksheet.cell(first_row + offset, column, numeric)
                     cell.number_format = "0.0"
                 except (TypeError, ValueError):
-                    invalid_values.append(row["filename"])
+                    invalid.append(row["filename"])
 
-            if invalid_values:
-                st.error("数値に変換できないためExcelへ入れられない画像：" + "、".join(invalid_values))
+            if invalid:
+                st.error("数値に変換できない画像：" + "、".join(invalid))
             else:
                 end = f"{get_column_letter(column)}{first_row + len(rows) - 1}"
                 output = io.BytesIO()
