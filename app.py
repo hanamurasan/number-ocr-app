@@ -1,60 +1,369 @@
-import io,re,cv2,numpy as np,pandas as pd,streamlit as st
-from PIL import Image
+import io
+import re
 from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
 from openpyxl import load_workbook
-from openpyxl.utils.cell import coordinate_from_string,column_index_from_string,get_column_letter
-B=Path(__file__).parent;st.set_page_config(page_title='一桁ずつ認識→Excel',page_icon='🔢',layout='wide');st.title('🔢 数字を一桁ずつ認識してExcelへ入力');st.caption('十字を自動検出した後、各桁を0〜9から個別判定します。登録済みの数値全体から選ぶ方式ではありません。')
-L=pd.read_csv(B/'labels.csv',dtype=str);CT=[cv2.imread(str(p),0) for p in (B/'cross_templates').glob('*.png')]
-def timekey(n):
- m=re.search(r'_(\d+(?:\.\d+)?)s(?:\.[^.]+)?$',n,re.I);return (0,float(m.group(1))) if m else (1,n.lower())
+from openpyxl.utils.cell import (
+    coordinate_from_string,
+    column_index_from_string,
+    get_column_letter,
+)
+
+B = Path(__file__).parent
+st.set_page_config(page_title="輪郭検出で一桁ずつ認識→Excel", page_icon="🔢", layout="wide")
+st.title("🔢 角度補正＋輪郭検出で数字を一桁ずつ認識")
+st.caption("数字3文字を輪郭から検出し、最後の数字の前に小数点を自動挿入します。")
+
+L = pd.read_csv(B / "labels.csv", dtype=str)
+CT = [cv2.imread(str(p), 0) for p in (B / "cross_templates").glob("*.png")]
+CT = [x for x in CT if x is not None]
+
+
+def timekey(name):
+    m = re.search(r"_(\d+(?:\.\d+)?)s(?:\.[^.]+)?$", name, re.I)
+    return (0, float(m.group(1))) if m else (1, name.lower())
+
+
 def cross(rgb):
- g=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY);e=cv2.Canny(g,45,140);h,w=g.shape;best=(-2,None,None)
- for t0 in CT:
-  z0=cv2.Canny(t0,45,140)
-  for s in np.linspace(.45,2.4,32):
-   tw,th=max(10,int(z0.shape[1]*s)),max(10,int(z0.shape[0]*s))
-   if tw>=w or th>=h:continue
-   z=cv2.resize(z0,(tw,th));r=cv2.matchTemplate(e,z,cv2.TM_CCOEFF_NORMED);mask=np.full(r.shape,-2,np.float32);mask[int(r.shape[0]*.12):int(r.shape[0]*.9),int(r.shape[1]*.1):int(r.shape[1]*.9)]=r[int(r.shape[0]*.12):int(r.shape[0]*.9),int(r.shape[1]*.1):int(r.shape[1]*.9)];_,sc,_,loc=cv2.minMaxLoc(mask)
-   if sc>best[0]:best=(sc,(loc[0]+tw//2,loc[1]+th//2),max(tw,th))
- return best
-def roi(rgb,c,sz):
- cx,cy=c;u=sz/30.;h,w=rgb.shape[:2];box=(max(0,int(cx-45*u)),max(0,int(cy-30*u)),min(w,int(cx-3*u)),min(h,int(cy-6*u)));return rgb[box[1]:box[3],box[0]:box[2]],box
-def normroi(x):return cv2.resize(cv2.cvtColor(x,cv2.COLOR_RGB2GRAY),(126,72),interpolation=cv2.INTER_CUBIC)
-# Three fixed character slots inside cross-normalized ROI: tens, ones, tenths. Decimal is inserted by rule.
-S=[(0,42),(32,74),(80,122)]
-def charfeat(g,i):
- x1,x2=S[i];p=g[5:70,x1:x2];p=cv2.resize(p,(32,48));p=cv2.Laplacian(p,cv2.CV_32F);return (p-p.mean())/(p.std()+1e-6)
-T=[]
-for _,r in L.iterrows():
- rgb=np.array(Image.open(B/'training'/r.filename).convert('RGB'));sc,c,sz=cross(rgb)
- if c:
-  rr,_=roi(rgb,c,sz);g=normroi(rr)
-  for i,ch in enumerate(r.value.replace('.','')):T.append((i,ch,charfeat(g,i)))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edge = cv2.Canny(gray, 45, 140)
+    h, w = gray.shape
+    best = (-2.0, None, None)
+
+    for template in CT:
+        template_edge = cv2.Canny(template, 45, 140)
+        for scale in np.linspace(0.45, 2.4, 32):
+            tw = max(10, int(template_edge.shape[1] * scale))
+            th = max(10, int(template_edge.shape[0] * scale))
+            if tw >= w or th >= h:
+                continue
+
+            resized = cv2.resize(template_edge, (tw, th))
+            result = cv2.matchTemplate(edge, resized, cv2.TM_CCOEFF_NORMED)
+            mask = np.full(result.shape, -2, np.float32)
+            y1, y2 = int(result.shape[0] * 0.12), int(result.shape[0] * 0.90)
+            x1, x2 = int(result.shape[1] * 0.10), int(result.shape[1] * 0.90)
+            mask[y1:y2, x1:x2] = result[y1:y2, x1:x2]
+            _, score, _, loc = cv2.minMaxLoc(mask)
+
+            if score > best[0]:
+                best = (score, (loc[0] + tw // 2, loc[1] + th // 2), max(tw, th))
+    return best
+
+
+def roi(rgb, center, size):
+    cx, cy = center
+    unit = size / 30.0
+    h, w = rgb.shape[:2]
+    box = (
+        max(0, int(cx - 45 * unit)),
+        max(0, int(cy - 30 * unit)),
+        min(w, int(cx - 3 * unit)),
+        min(h, int(cy - 6 * unit)),
+    )
+    return rgb[box[1]:box[3], box[0]:box[2]], box
+
+
+def normroi(x):
+    if x is None or x.size == 0:
+        return None
+    gray = cv2.cvtColor(x, cv2.COLOR_RGB2GRAY)
+    return cv2.resize(gray, (252, 144), interpolation=cv2.INTER_CUBIC)
+
+
+def binary_image(gray):
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    bw = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 7
+    )
+    # 細い切れ目だけをつなぎ、隣の数字同士は結合しにくい縦長カーネル
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 3))
+    return cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+
+def raw_digit_boxes(bw):
+    h, w = bw.shape
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for contour in contours:
+        x, y, cw, ch = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        # 小数点、十字の残り、微小ノイズを除外
+        if ch < h * 0.28 or ch > h * 0.98:
+            continue
+        if cw < w * 0.018 or cw > w * 0.34:
+            continue
+        if area < h * w * 0.0012:
+            continue
+        boxes.append((x, y, cw, ch))
+    return sorted(boxes, key=lambda b: b[0])
+
+
+def rotate_gray(gray, angle):
+    h, w = gray.shape
+    matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(
+        gray, matrix, (w, h), flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+def deskew(gray):
+    """数字候補の中心を直線近似し、数字列が水平になるように回転する。"""
+    bw = binary_image(gray)
+    boxes = raw_digit_boxes(bw)
+    if len(boxes) < 2:
+        return gray, 0.0
+
+    # 大きい候補を最大5個に絞り、x順で傾きを求める
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[:5]
+    boxes = sorted(boxes, key=lambda b: b[0])
+    xs = np.array([x + w / 2 for x, y, w, h in boxes], dtype=np.float32)
+    ys = np.array([y + h / 2 for x, y, w, h in boxes], dtype=np.float32)
+    if float(xs.max() - xs.min()) < 10:
+        return gray, 0.0
+
+    slope = float(np.polyfit(xs, ys, 1)[0])
+    angle = float(np.degrees(np.arctan(slope)))
+    angle = float(np.clip(angle, -18.0, 18.0))
+    return rotate_gray(gray, angle), angle
+
+
+def choose_three_boxes(boxes):
+    """数字候補が多い場合、近い高さ・大きさで左から連続する3個を選ぶ。"""
+    if len(boxes) < 3:
+        return []
+    if len(boxes) == 3:
+        return boxes
+
+    best_score = -1e9
+    best = None
+    for i in range(len(boxes) - 2):
+        group = boxes[i:i + 3]
+        heights = np.array([b[3] for b in group], dtype=float)
+        centers_y = np.array([b[1] + b[3] / 2 for b in group], dtype=float)
+        gaps = np.array([
+            group[1][0] - (group[0][0] + group[0][2]),
+            group[2][0] - (group[1][0] + group[1][2]),
+        ], dtype=float)
+        score = (
+            heights.mean()
+            - 2.0 * heights.std()
+            - 1.5 * centers_y.std()
+            - 0.5 * abs(gaps[0] - gaps[1])
+        )
+        if score > best_score:
+            best_score = score
+            best = group
+    return best or []
+
+
+def extract_digits(gray):
+    corrected, angle = deskew(gray)
+    bw = binary_image(corrected)
+    boxes = choose_three_boxes(raw_digit_boxes(bw))
+    digits = []
+
+    for x, y, w, h in boxes:
+        pad_x = max(2, int(w * 0.15))
+        pad_y = max(2, int(h * 0.08))
+        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+        x2, y2 = min(bw.shape[1], x + w + pad_x), min(bw.shape[0], y + h + pad_y)
+        digits.append(bw[y1:y2, x1:x2])
+    return digits, boxes, corrected, bw, angle
+
+
+def charfeat(binary_digit):
+    """輪郭で切り出した1文字を余白付き48×64へ正規化する。"""
+    if binary_digit is None or binary_digit.size == 0:
+        return None
+    ys, xs = np.where(binary_digit > 0)
+    if len(xs) == 0:
+        return None
+    crop = binary_digit[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    h, w = crop.shape
+    scale = min(38 / max(w, 1), 54 / max(h, 1))
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((64, 48), np.uint8)
+    x0, y0 = (48 - nw) // 2, (64 - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    feat = cv2.GaussianBlur(canvas, (3, 3), 0).astype(np.float32) / 255.0
+    return (feat - feat.mean()) / (feat.std() + 1e-6)
+
+
+# 学習画像から各桁テンプレートを作成
+T = []
+training_failures = []
+for _, row in L.iterrows():
+    path = B / "training" / row.filename
+    if not path.exists():
+        training_failures.append(str(row.filename))
+        continue
+    rgb = np.array(Image.open(path).convert("RGB"))
+    score, center, size = cross(rgb)
+    if not center:
+        training_failures.append(str(row.filename))
+        continue
+    region, _ = roi(rgb, center, size)
+    gray = normroi(region)
+    if gray is None:
+        training_failures.append(str(row.filename))
+        continue
+    digit_images, _, _, _, _ = extract_digits(gray)
+    label_digits = re.sub(r"\D", "", str(row.value))
+    if len(digit_images) != 3 or len(label_digits) != 3:
+        training_failures.append(str(row.filename))
+        continue
+    for position, (digit, image) in enumerate(zip(label_digits, digit_images)):
+        feature = charfeat(image)
+        if feature is not None:
+            T.append((position, digit, feature))
+
+
 def recognize(rgb):
- sc,c,sz=cross(rgb)
- if not c:return '',0,None,None,[]
- rr,box=roi(rgb,c,sz);g=normroi(rr);out='';details=[];scores=[]
- for i in range(3):
-  q=charfeat(g,i);rank=sorted([(float((q*t).mean()),d) for pos,d,t in T if pos==i],reverse=True);out+=rank[0][1];scores.append(rank[0][0]);details.append(rank[:4])
- return out[:2]+'.'+out[2],float(np.mean(scores)),box,c,details
-def cellok(x):return bool(re.fullmatch(r'[A-Za-z]{1,3}[1-9][0-9]*',x.strip()))
-excel=st.file_uploader('1. 入力先Excel',type=['xlsx']);fs=sorted(st.file_uploader('2. 写真を選択',type=['png','jpg','jpeg','webp'],accept_multiple_files=True) or [],key=lambda f:timekey(f.name))
-if fs:st.info('時間順：'+' → '.join(x.name for x in fs))
-rows=[]
-for i,f in enumerate(fs):
- rgb=np.array(Image.open(f).convert('RGB'));v,conf,box,c,det=recognize(rgb);m=rgb.copy()
- if box:cv2.rectangle(m,(box[0],box[1]),(box[2],box[3]),(0,255,0),2)
- if c:cv2.drawMarker(m,c,(255,0,255),cv2.MARKER_CROSS,20,2)
- a,b=st.columns([1,2]);a.image(m,caption=f.name);v=b.text_input('認識結果',v,key=str(i)+f.name);b.write(f'3桁の平均類似度 {conf:.2f}')
- if conf<.45:b.warning('信頼度が低いため確認してください。')
- with b.expander('各桁の候補'):
-  for k,x in enumerate(det):b.write(f'{k+1}桁目：'+', '.join(f'{d}({s:.2f})' for s,d in x))
- rows.append({'filename':f.name,'value':v,'confidence':round(conf,3)})
+    score, center, size = cross(rgb)
+    if not center:
+        return "", 0.0, None, None, [], None, [], 0.0
+
+    region, box = roi(rgb, center, size)
+    gray = normroi(region)
+    if gray is None:
+        return "", 0.0, box, center, [], None, [], 0.0
+
+    digit_images, digit_boxes, corrected, bw, angle = extract_digits(gray)
+    if len(digit_images) != 3:
+        return "", 0.0, box, center, [], bw, digit_boxes, angle
+
+    output = ""
+    details = []
+    scores = []
+    for position, digit_image in enumerate(digit_images):
+        query = charfeat(digit_image)
+        candidates = [
+            (float((query * template).mean()), digit)
+            for pos, digit, template in T
+            if pos == position and query is not None
+        ]
+        if not candidates:
+            return "", 0.0, box, center, details, bw, digit_boxes, angle
+
+        # 同じ数字の複数テンプレートのうち最高値を代表値にする
+        best_by_digit = {}
+        for similarity, digit in candidates:
+            best_by_digit[digit] = max(similarity, best_by_digit.get(digit, -1e9))
+        ranking = sorted(
+            [(similarity, digit) for digit, similarity in best_by_digit.items()],
+            reverse=True,
+        )
+        output += ranking[0][1]
+        scores.append(ranking[0][0])
+        details.append(ranking[:4])
+
+    value = output[:-1] + "." + output[-1]
+    return value, float(np.mean(scores)), box, center, details, bw, digit_boxes, angle
+
+
+def cellok(value):
+    return bool(re.fullmatch(r"[A-Za-z]{1,3}[1-9][0-9]*", value.strip()))
+
+
+if training_failures:
+    with st.expander(f"学習に使えなかった画像：{len(training_failures)}枚"):
+        st.write("、".join(training_failures))
+
+st.write(f"使用できる一桁テンプレート：{len(T)}個")
+excel = st.file_uploader("1. 入力先Excel", type=["xlsx"])
+files = sorted(
+    st.file_uploader(
+        "2. 写真を選択",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+    ) or [],
+    key=lambda f: timekey(f.name),
+)
+
+if files:
+    st.info("時間順：" + " → ".join(x.name for x in files))
+
+rows = []
+for i, file in enumerate(files):
+    rgb = np.array(Image.open(file).convert("RGB"))
+    value, confidence, box, center, details, bw, digit_boxes, angle = recognize(rgb)
+    marked = rgb.copy()
+
+    if box:
+        cv2.rectangle(marked, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+    if center:
+        cv2.drawMarker(marked, center, (255, 0, 255), cv2.MARKER_CROSS, 20, 2)
+
+    left, right = st.columns([1, 2])
+    left.image(marked, caption=file.name, width="stretch")
+    value = right.text_input("認識結果", value, key=str(i) + file.name)
+    right.write(f"角度補正：{angle:+.1f}°　3桁の平均類似度：{confidence:.2f}")
+
+    if bw is not None:
+        preview = cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
+        for x, y, w, h in digit_boxes:
+            cv2.rectangle(preview, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        right.image(preview, caption=f"検出した数字：{len(digit_boxes)}個", width="stretch")
+
+    if len(digit_boxes) != 3:
+        right.error("数字を3個検出できませんでした。認識結果を手入力してください。")
+    elif confidence < 0.45:
+        right.warning("信頼度が低いため確認してください。")
+
+    with right.expander("各桁の候補"):
+        for k, candidates in enumerate(details):
+            right.write(
+                f"{k + 1}桁目：" +
+                ", ".join(f"{digit}({similarity:.2f})" for similarity, digit in candidates)
+            )
+
+    rows.append({
+        "filename": file.name,
+        "value": value,
+        "confidence": round(confidence, 3),
+        "angle": round(angle, 2),
+        "detected_digits": len(digit_boxes),
+    })
+
 if rows:
- st.dataframe(pd.DataFrame(rows),width='stretch')
- if excel:
-  wb=load_workbook(io.BytesIO(excel.getvalue()));sn=st.selectbox('入力シート',wb.sheetnames);start=st.text_input('開始セル','C4')
-  if cellok(start):
-   letters,r0=coordinate_from_string(start.upper());col=column_index_from_string(letters);ws=wb[sn]
-   for j,x in enumerate(rows):ws.cell(r0+j,col,float(x['value']));ws.cell(r0+j,col).number_format='0.0'
-   end=f'{get_column_letter(col)}{r0+len(rows)-1}';o=io.BytesIO();wb.save(o);st.success(f'{start.upper()}:{end}へ入力しました');st.download_button('入力済みExcelをダウンロード',o.getvalue(),f'{Path(excel.name).stem}_入力済み.xlsx')
+    st.dataframe(pd.DataFrame(rows), width="stretch")
+    if excel:
+        workbook = load_workbook(io.BytesIO(excel.getvalue()))
+        sheet_name = st.selectbox("入力シート", workbook.sheetnames)
+        start = st.text_input("開始セル", "C4")
+
+        if cellok(start):
+            letters, first_row = coordinate_from_string(start.upper())
+            column = column_index_from_string(letters)
+            worksheet = workbook[sheet_name]
+            invalid_values = []
+
+            for offset, row in enumerate(rows):
+                try:
+                    numeric_value = float(row["value"])
+                    cell = worksheet.cell(first_row + offset, column, numeric_value)
+                    cell.number_format = "0.0"
+                except (TypeError, ValueError):
+                    invalid_values.append(row["filename"])
+
+            if invalid_values:
+                st.error("数値に変換できないためExcelへ入れられない画像：" + "、".join(invalid_values))
+            else:
+                end = f"{get_column_letter(column)}{first_row + len(rows) - 1}"
+                output = io.BytesIO()
+                workbook.save(output)
+                st.success(f"{start.upper()}:{end}へ入力しました")
+                st.download_button(
+                    "入力済みExcelをダウンロード",
+                    output.getvalue(),
+                    f"{Path(excel.name).stem}_入力済み.xlsx",
+                )
