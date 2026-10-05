@@ -17,7 +17,7 @@ from openpyxl.utils.cell import (
 B = Path(__file__).parent
 st.set_page_config(page_title="位置補正版・一桁ずつ認識→Excel", page_icon="🔢", layout="wide")
 st.title("🔢 文字を中央寄せして一桁ずつ認識")
-st.caption("輪郭検出は使いません。小数点を避けて3桁を切り出し、各文字を中央寄せして0〜9の全テンプレートと比較します。")
+st.caption("紫色の十字を色と形で検出し、その左上の数字3桁を読み取ります。小数点は認識対象から外します。")
 
 L = pd.read_csv(B / "labels.csv", dtype=str)
 CT = [cv2.imread(str(p), 0) for p in (B / "cross_templates").glob("*.png")]
@@ -29,12 +29,12 @@ def timekey(name):
     return (0, float(m.group(1))) if m else (1, name.lower())
 
 
-def cross(rgb):
+def _template_cross(rgb):
+    """色検出に失敗した場合だけ使う従来のテンプレート照合。"""
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     edge = cv2.Canny(gray, 45, 140)
     h, w = gray.shape
     best = (-2.0, None, None)
-
     for template in CT:
         z0 = cv2.Canny(template, 45, 140)
         for scale in np.linspace(0.45, 2.4, 32):
@@ -44,15 +44,75 @@ def cross(rgb):
                 continue
             z = cv2.resize(z0, (tw, th))
             result = cv2.matchTemplate(edge, z, cv2.TM_CCOEFF_NORMED)
-            mask = np.full(result.shape, -2, np.float32)
-            y1, y2 = int(result.shape[0] * 0.12), int(result.shape[0] * 0.90)
-            x1, x2 = int(result.shape[1] * 0.10), int(result.shape[1] * 0.90)
-            mask[y1:y2, x1:x2] = result[y1:y2, x1:x2]
-            _, score, _, loc = cv2.minMaxLoc(mask)
+            _, score, _, loc = cv2.minMaxLoc(result)
             if score > best[0]:
                 best = (score, (loc[0] + tw // 2, loc[1] + th // 2), max(tw, th))
     return best
 
+
+def cross(rgb):
+    """紫色の十字を色と十字形状で検出する。背景の模様は使わない。"""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h, w = hsv.shape[:2]
+
+    # OpenCV HSVで紫～マゼンタ。彩度の低い白・水色の十字は除外する。
+    mask = cv2.inRange(hsv, np.array([135, 75, 70]), np.array([179, 255, 255]))
+    mask[:int(h * 0.15), :] = 0
+    mask[int(h * 0.90):, :] = 0
+    mask[:, :int(w * 0.08)] = 0
+    mask[:, int(w * 0.92):] = 0
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+    count, labels, stats, centers = cv2.connectedComponentsWithStats(mask)
+    best = None
+    best_score = -1e9
+    min_side = min(h, w)
+
+    for i in range(1, count):
+        x, y, cw, ch, area = stats[i]
+        if area < 18:
+            continue
+        if cw < min_side * 0.025 or ch < min_side * 0.025:
+            continue
+        if cw > min_side * 0.16 or ch > min_side * 0.16:
+            continue
+        ratio = cw / max(ch, 1)
+        if not 0.55 <= ratio <= 1.80:
+            continue
+
+        cx, cy = centers[i]
+        half = int(max(cw, ch) * 0.70)
+        x1, x2 = max(0, int(cx) - half), min(w, int(cx) + half + 1)
+        y1, y2 = max(0, int(cy) - half), min(h, int(cy) + half + 1)
+        patch = mask[y1:y2, x1:x2] > 0
+        if patch.size == 0:
+            continue
+
+        ph, pw = patch.shape
+        band_x = max(1, pw // 8)
+        band_y = max(1, ph // 8)
+        vertical = patch[:, max(0, pw // 2 - band_x):min(pw, pw // 2 + band_x + 1)].mean()
+        horizontal = patch[max(0, ph // 2 - band_y):min(ph, ph // 2 + band_y + 1), :].mean()
+        corners = np.concatenate([
+            patch[:max(1, ph // 4), :max(1, pw // 4)].ravel(),
+            patch[:max(1, ph // 4), -max(1, pw // 4):].ravel(),
+            patch[-max(1, ph // 4):, :max(1, pw // 4)].ravel(),
+            patch[-max(1, ph // 4):, -max(1, pw // 4):].ravel(),
+        ]).mean()
+        plus_score = vertical + horizontal - 1.4 * corners
+        area_score = min(area / max(cw * ch, 1), 0.55)
+        score = plus_score + area_score
+
+        if score > best_score:
+            best_score = score
+            # 色マスクの十字は線幅のみなので、従来ROIと同じ尺度になるよう約1.3倍
+            size = int(max(cw, ch) * 1.30)
+            best = (float(score), (int(round(cx)), int(round(cy))), max(size, 20))
+
+    # 誤検出のまま切り出さず、十分十字らしい候補がない時だけ従来法へ戻る
+    if best is not None and best_score >= 0.55:
+        return best
+    return _template_cross(rgb)
 
 def roi(rgb, center, size):
     cx, cy = center
@@ -118,70 +178,9 @@ def longest_active_span(profile, threshold, max_gap=4):
 
 
 def align_number(gray):
-    """
-    輪郭を使わず、縦横のエッジ投影から数字列全体を探す。
-    小数点を含む数字列全体を標準キャンバス126×72へ配置する。3つの数字枠は等分せず、小数点の幅を空ける。
-    """
-    gray = cv2.resize(gray, (252, 144), interpolation=cv2.INTER_CUBIC)
-    corrected, angle = deskew(gray)
-
-    blur = cv2.GaussianBlur(corrected, (3, 3), 0)
-    gx = np.abs(cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3))
-    gy = np.abs(cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3))
-    energy = gx + gy
-    h, w = energy.shape
-
-    # 十字や外枠が入りやすい端を無視して、数字列の縦位置を投影で探す
-    row_profile = energy[:, int(w * 0.05):int(w * 0.95)].mean(axis=1)
-    row_profile[:int(h * 0.08)] = 0
-    row_profile[int(h * 0.92):] = 0
-    row_threshold = max(float(np.percentile(row_profile, 62)), float(row_profile.mean() * 1.05))
-    row_span = longest_active_span(row_profile, row_threshold, max_gap=5)
-
-    if row_span is None:
-        y1, y2 = int(h * 0.15), int(h * 0.88)
-    else:
-        y1, y2 = row_span
-        pad = max(4, int((y2 - y1) * 0.18))
-        y1, y2 = max(0, y1 - pad), min(h, y2 + pad)
-
-    # 数字の高さとして不自然なら安全な中央範囲へ戻す
-    if y2 - y1 < h * 0.30 or y2 - y1 > h * 0.90:
-        y1, y2 = int(h * 0.15), int(h * 0.88)
-
-    col_profile = energy[y1:y2, :].mean(axis=0)
-    col_profile[:int(w * 0.03)] = 0
-    col_profile[int(w * 0.97):] = 0
-    col_threshold = max(float(np.percentile(col_profile, 58)), float(col_profile.mean()))
-    col_span = longest_active_span(col_profile, col_threshold, max_gap=8)
-
-    if col_span is None:
-        x1, x2 = int(w * 0.05), int(w * 0.95)
-    else:
-        x1, x2 = col_span
-        pad = max(6, int((x2 - x1) * 0.08))
-        x1, x2 = max(0, x1 - pad), min(w, x2 + pad)
-
-    # 3桁として幅が狭すぎる・広すぎる検出は採用しない
-    if x2 - x1 < w * 0.35 or x2 - x1 > w * 0.96:
-        x1, x2 = int(w * 0.05), int(w * 0.95)
-
-    crop = corrected[y1:y2, x1:x2]
-    if crop.size == 0:
-        crop = corrected
-        x1, y1, x2, y2 = 0, 0, w, h
-
-    # 縦横比を保持して標準キャンバスへ中央配置
-    target_w, target_h = 126, 72
-    ch, cw = crop.shape
-    scale = min((target_w - 4) / max(cw, 1), (target_h - 4) / max(ch, 1))
-    nw, nh = max(1, int(cw * scale)), max(1, int(ch * scale))
-    resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
-    canvas = np.full((target_h, target_w), int(np.median(corrected)), np.uint8)
-    ox, oy = (target_w - nw) // 2, (target_h - nh) // 2
-    canvas[oy:oy + nh, ox:ox + nw] = resized
-
-    return canvas, corrected, (x1, y1, x2, y2), angle
+    """正しく検出した十字基準ROIを、そのまま共通サイズへ正規化する。"""
+    aligned = cv2.resize(gray, (126, 72), interpolation=cv2.INTER_CUBIC)
+    return aligned, aligned.copy(), (0, 0, 126, 72), 0.0
 
 
 # 小数点の場所を空けた固定3スロット。小数点は読み取らず、最後に規則で挿入する。
