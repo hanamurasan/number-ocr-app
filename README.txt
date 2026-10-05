@@ -1,9 +1,5 @@
-使い方
-1. app_model.py を app.py に変更してください。
-2. app.py、digit_model.joblib、requirements.txt の3ファイルをGitHubへアップロードしてください。
-3. Streamlitアプリが再起動したら写真を試してください。
+修正版
+- StreamlitのUploadedFileをバイト列として開くよう修正しました。
+- 学習時と実行時のscikit-learn等のバージョンを固定しました。
 
-注意
-- このモデルは提供された正解付き画像から作成しています。
-- 認識確率が0.55未満の場合は画面に警告します。
-- 現在の検証正解率は約78%であり、完全ではありません。
+GitHubへ app.py、digit_model.joblib、requirements.txt を上書きアップロードしてください。

@@ -59,7 +59,14 @@ files=sorted(st.file_uploader('2. 写真を選択',type=['png','jpg','jpeg','web
 if files:st.info('時間順：'+' → '.join(f.name for f in files))
 rows=[]
 for i,f in enumerate(files):
- rgb=np.array(Image.open(f).convert('RGB'))
+
+ try:
+  image_bytes=f.getvalue()
+  if not image_bytes: raise ValueError('画像データが空です')
+  rgb=np.array(Image.open(io.BytesIO(image_bytes)).convert('RGB'))
+ except Exception as e:
+  st.error(f'{f.name} を画像として開けませんでした：{e}')
+  continue
  value,conf,box,center,details,aligned,gs=recognize(rgb)
  marked=rgb.copy()
  if box:cv2.rectangle(marked,(box[0],box[1]),(box[2],box[3]),(0,255,0),2)
