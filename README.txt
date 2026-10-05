@@ -1,13 +1,9 @@
-専用数値認識 v4
+使い方
+1. app_model.py を app.py に変更してください。
+2. app.py、digit_model.joblib、requirements.txt の3ファイルをGitHubへアップロードしてください。
+3. Streamlitアプリが再起動したら写真を試してください。
 
-Tesseractは使いません。提供された画像から数字の形を比較します。
-
-起動方法
-1. 現在のPowerShellで Ctrl+C
-2. このフォルダを開き、アドレス欄へ powershell と入力
-3. py -m pip install -r requirements.txt
-4. py -m streamlit run app.py
-
-注意: 現在は同じ解像度・同じ画面配置の写真向けです。
-
-修正: CSVの数値を文字列として読むように変更しました。
+注意
+- このモデルは提供された正解付き画像から作成しています。
+- 認識確率が0.55未満の場合は画面に警告します。
+- 現在の検証正解率は約78%であり、完全ではありません。
