@@ -16,8 +16,8 @@ from openpyxl.utils.cell import (
 
 B = Path(__file__).parent
 st.set_page_config(page_title="位置補正版・一桁ずつ認識→Excel", page_icon="🔢", layout="wide")
-st.title("🔢 数字列の位置をそろえて一桁ずつ認識")
-st.caption("輪郭検出は使いません。十字を基準に切り出し、傾きと数字列の位置を補正してから固定3スロットで判定します。")
+st.title("🔢 文字を中央寄せして一桁ずつ認識")
+st.caption("輪郭検出は使いません。小数点を避けて3桁を切り出し、各文字を中央寄せして0〜9の全テンプレートと比較します。")
 
 L = pd.read_csv(B / "labels.csv", dtype=str)
 CT = [cv2.imread(str(p), 0) for p in (B / "cross_templates").glob("*.png")]
@@ -189,12 +189,53 @@ SLOTS = [(0, 39), (35, 74), (82, 124)]
 DECIMAL_GAP = (74, 82)
 
 
-def charfeat(aligned, position):
+def normalize_character(aligned, position):
+    """各枠内の文字を投影で中央寄せする。輪郭検出は使わない。"""
     x1, x2 = SLOTS[position]
-    part = aligned[3:69, x1:x2]
-    part = cv2.resize(part, (32, 48), interpolation=cv2.INTER_CUBIC)
-    feature = cv2.Laplacian(part, cv2.CV_32F)
-    return (feature - feature.mean()) / (feature.std() + 1e-6)
+    part = aligned[2:70, x1:x2].copy()
+    part = cv2.GaussianBlur(part, (3, 3), 0)
+
+    # 明るい文字・暗い文字の両方を試し、前景が少ない方を採用
+    _, dark = cv2.threshold(part, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, light = cv2.threshold(part, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    dark_ratio = np.mean(dark > 0)
+    light_ratio = np.mean(light > 0)
+    binary = dark if abs(dark_ratio - 0.24) <= abs(light_ratio - 0.24) else light
+
+    # 枠の端に入った隣の数字や線を弱める
+    binary[:, :2] = 0
+    binary[:, -2:] = 0
+    binary[:2, :] = 0
+    binary[-2:, :] = 0
+
+    row = np.count_nonzero(binary, axis=1)
+    col = np.count_nonzero(binary, axis=0)
+    ys = np.where(row >= max(1, int(binary.shape[1] * 0.06)))[0]
+    xs = np.where(col >= max(1, int(binary.shape[0] * 0.06)))[0]
+
+    if len(xs) == 0 or len(ys) == 0:
+        crop = binary
+    else:
+        crop = binary[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1]
+
+    h, w = crop.shape
+    scale = min(30 / max(w, 1), 46 / max(h, 1))
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((52, 36), np.uint8)
+    ox, oy = (36 - nw) // 2, (52 - nh) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = resized
+    return canvas
+
+
+def charfeat(aligned, position):
+    """二値形状と縦横勾配を組み合わせた特徴量。"""
+    glyph = normalize_character(aligned, position).astype(np.float32) / 255.0
+    gx = cv2.Sobel(glyph, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(glyph, cv2.CV_32F, 0, 1, ksize=3)
+    feature = np.concatenate([glyph.ravel(), (gx * 0.35).ravel(), (gy * 0.35).ravel()])
+    norm = np.linalg.norm(feature)
+    return feature / (norm + 1e-6)
 
 
 # 学習画像にも新規画像にも同じ自動整列を適用する
@@ -242,20 +283,22 @@ def recognize(rgb):
     for position in range(3):
         query = charfeat(aligned, position)
         candidates = [
-            (float((query * template).mean()), digit)
-            for pos, digit, template in T if pos == position
+            (float(np.dot(query, template)), digit)
+            for _template_position, digit, template in T
         ]
         if not candidates:
             return "", 0.0, box, center, details, aligned, align_box, angle
 
-        # 同じ数字の登録画像が多くても不公平にならないよう、各数字の最高値だけを比較
-        best_by_digit = {}
+        # 各数字について上位3テンプレートの平均を使う。
+        # 1枚だけ偶然似た画像に引っ張られにくくする。
+        grouped = {}
         for similarity, digit in candidates:
-            best_by_digit[digit] = max(similarity, best_by_digit.get(digit, -1e9))
-        ranking = sorted(
-            [(similarity, digit) for digit, similarity in best_by_digit.items()],
-            reverse=True,
-        )
+            grouped.setdefault(digit, []).append(similarity)
+        ranking = []
+        for digit, values in grouped.items():
+            top = sorted(values, reverse=True)[:3]
+            ranking.append((float(np.mean(top)), digit))
+        ranking.sort(reverse=True)
         output += ranking[0][1]
         scores.append(ranking[0][0])
         details.append(ranking[:4])
@@ -308,6 +351,8 @@ for i, file in enumerate(files):
             cv2.rectangle(preview, (x1, 3), (x2, 69), (255, 0, 0), 1)
         cv2.rectangle(preview, (DECIMAL_GAP[0], 48), (DECIMAL_GAP[1], 69), (0, 255, 255), 1)
         right.image(preview, caption="赤枠＝数字3桁、黄色枠＝無視する小数点部分", width="stretch")
+        digit_previews = [normalize_character(aligned, k) for k in range(3)]
+        right.image(digit_previews, caption=["1桁目", "2桁目", "3桁目"], width=90)
 
     if confidence < 0.45:
         right.warning("信頼度が低いため確認してください。")
